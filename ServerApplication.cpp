@@ -3,14 +3,18 @@
 //
 
 #include "ServerApplication.h"
+#include "MqttListener.h"
+
 #include <vector>
 
 ServerApplication::ServerApplication()
     : Poco::Util::ServerApplication()
 {
+    addSubsystem(new MqttListener);
 }
 
 int ServerApplication::main(const std::vector <std::string> &args)
 {
-    return 1;
+    waitForTerminationRequest();
+    return 0;
 }
