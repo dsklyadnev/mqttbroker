@@ -1,7 +1,7 @@
 # MqttBroker
 C++ MQTT protocol broker
 
-Project is fully based on Poco library and CMake.
+Project is fully based on [Poco](https://github.com/pocoproject/poco) library and [CMake](http://www.cmake.org/).
 
 Project is in start phase and is not usable yet.
 
