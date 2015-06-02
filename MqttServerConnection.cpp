@@ -92,6 +92,13 @@ namespace Mqtt
         SuccessMaximumQos2 = 0x02,
         Failure            = 0x80
     };
+
+    struct PublishFlags
+    {
+        bool    dup    = false;
+        uint8_t qos    = 0;
+        bool    retain = false;
+    };
 }
 
 MqttServerConnection::MqttServerConnection(const Poco::Net::StreamSocket &streamSocket)
@@ -136,24 +143,27 @@ void MqttServerConnection::run()
                 ptr += 2;
                 std::string clientId(reinterpret_cast<char *>(ptr), clientIdLen);
                 ptr += clientIdLen;
-                if (variableHeader.connectFlags.willFlag) {
-                    uint16_t willTopicLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                if (variableHeader.connectFlags.willFlag)
+                {
+                    uint16_t willTopicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
                     std::string willTopic(reinterpret_cast<char *>(ptr), willTopicLen);
                     ptr += willTopicLen;
-                    uint16_t willMessageLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                    uint16_t willMessageLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
                     std::string willMessage(reinterpret_cast<char *>(ptr), willMessageLen);
                     ptr += willMessageLen;
                 }
-                if (variableHeader.connectFlags.userNameFlag) {
-                    uint16_t userNameLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                if (variableHeader.connectFlags.userNameFlag)
+                {
+                    uint16_t userNameLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
                     std::string userName(reinterpret_cast<char *>(ptr), userNameLen);
                     ptr += userNameLen;
                 }
-                if (variableHeader.connectFlags.passwordFlag) {
-                    uint16_t passwordLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                if (variableHeader.connectFlags.passwordFlag)
+                {
+                    uint16_t passwordLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
                     std::vector<uint8_t> password(passwordLen);
                     memcpy(password.data(), ptr, passwordLen);
@@ -174,12 +184,12 @@ void MqttServerConnection::run()
             break;
             case (uint8_t) Mqtt::ControlPacketType::SUBSCRIBE:
             {
-                uint16_t packetIdentifier = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                uint16_t packetIdentifier = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                 ptr += 2;
                 std::vector <SubTopic> topics;
                 while (ptr - data.data() - 2 < fixedHeader->length)
                 {
-                    uint16_t topicLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                    uint16_t topicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
                     std::string topic(reinterpret_cast<char *>(ptr), topicLen);
                     ptr += topicLen;
@@ -194,7 +204,7 @@ void MqttServerConnection::run()
                     fixedHeader->length = 2 + topics.size();
                     ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
                     uint16_t * subackPackId = reinterpret_cast<uint16_t*>(ptr);
-                    *subackPackId = packetIdentifier;
+                    *subackPackId = Poco::ByteOrder::toBigEndian(packetIdentifier);
                     ptr += 2;
                     for (int i = 0; i < topics.size(); ++i)
                     {
@@ -205,6 +215,44 @@ void MqttServerConnection::run()
                 }
             }
             break;
+            case (uint8_t) Mqtt::ControlPacketType::UNSUBSCRIBE:
+            {
+                uint16_t packetIdentifier = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                ptr += 2;
+                //...
+            }
+            break;
+            case (uint8_t) Mqtt::ControlPacketType::PUBLISH:
+            {
+                uint16_t packetIdentifier = 0;
+                Mqtt::PublishFlags publishFlags;
+                publishFlags.retain = fixedHeader->flags & 1;
+                publishFlags.qos    = (fixedHeader->flags & 6) >> 1;
+                publishFlags.dup    = !!fixedHeader->flags & 8;
+                uint16_t topicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                ptr += 2;
+                std::string topic(reinterpret_cast<char *>(ptr), topicLen);
+                ptr += topicLen;
+                if (publishFlags.qos > 0)
+                {
+                    packetIdentifier = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+                    ptr += 2;
+                }
+                size_t payloadLen = fixedHeader->length - topic.size() - (publishFlags.qos > 0 ? 2 : 0);
+                std::vector <uint8_t> payload(payloadLen);
+                memcpy(payload.data(), ptr, payloadLen);
+                if (publishFlags.qos == 1)
+                { // Form PUBACK
+                    data.resize(sizeof(Mqtt::FrameFixedHeader) + 2);
+                    fixedHeader->controlPackerType = Mqtt::ControlPacketType::PUBACK;
+                    fixedHeader->flags = 0;
+                    fixedHeader->length = 2;
+                    ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
+                    uint16_t * subackPackId = reinterpret_cast<uint16_t*>(ptr);
+                    *subackPackId = Poco::ByteOrder::toBigEndian(packetIdentifier);
+                    socket().sendBytes(data.data(), data.size());
+                }
+            }
         }
 
         Poco::Util::Application &app = Poco::Util::Application::instance();
