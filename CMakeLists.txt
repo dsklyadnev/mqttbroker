@@ -4,7 +4,7 @@ project(mqttbroker)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 
 set(SOURCE_FILES main.cpp)
-add_executable(mqttbroker ${SOURCE_FILES} ServerApplication.cpp ServerApplication.h MqttListener.cpp MqttListener.h MqttServerConnection.cpp MqttServerConnection.h MqttServerConnectionFactory.cpp MqttServerConnectionFactory.h)
+add_executable(mqttbroker ${SOURCE_FILES} ServerApplication.cpp ServerApplication.h MqttListener.cpp MqttListener.h MqttServerConnection.cpp MqttServerConnection.h MqttServerConnectionFactory.cpp MqttServerConnectionFactory.h Singleton.h MainSingleton.cpp MainSingleton.h)
 
 message(Project settings: ${CMAKE_BUILD_TYPE})
 

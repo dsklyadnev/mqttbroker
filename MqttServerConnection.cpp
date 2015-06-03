@@ -3,6 +3,7 @@
 //
 
 #include "MqttServerConnection.h"
+#include "MainSingleton.h"
 
 #include <stdint.h>
 #include <Poco/Util/Application.h>
@@ -106,113 +107,88 @@ MqttServerConnection::MqttServerConnection(const Poco::Net::StreamSocket &stream
 {
 }
 
-struct SubTopic
+/// FIXME: UNSAFE!
+std::string getStringFromBuffer(uint8_t * & ptr)
 {
-    std::string topic;
-    uint8_t qos = 0;
-    SubTopic() = default;
-    SubTopic(const std::string & topic, uint8_t qos)
-        : topic(topic, qos)
-    {}
-};
+    uint16_t len = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
+    ptr += 2;
+    std::string result(reinterpret_cast<char *>(ptr), len);
+    ptr += len;
+    return result;
+}
+
+void formCONNACK(std::vector <uint8_t> & data, Mqtt::ConnectReturnCode returnCode, bool sessionPresent);
 
 void MqttServerConnection::run()
 {
-    std::vector<uint8_t>data(1024);
+    Poco::Util::Application &app = Poco::Util::Application::instance();
+    app.logger().debug("run");
+    std::vector<uint8_t>data;
+    data.reserve(4096);
 
     while(true)
     {
-        data.resize(1024);
-        socket().receiveBytes(data.data(), 2);
+        data.resize(2);
+        if (!socket().receiveBytes(data.data(), 2))
+        {
+            app.logger().error("Error receiving data");
+            socket().close();
+            return;
+        }
         auto fixedHeader = reinterpret_cast<Mqtt::FrameFixedHeader *>(data.data());
-        socket().receiveBytes(data.data() + 2, fixedHeader->length);
+        data.resize(2 + fixedHeader->length);
+        if (!socket().receiveBytes(data.data() + 2, fixedHeader->length))
+        {
+            app.logger().error("Error receiving data");
+            socket().close();
+            return;
+        }
 
         uint8_t *ptr = data.data() + 2;
         switch ((uint8_t) fixedHeader->controlPackerType)
         {
             case (uint8_t) Mqtt::ControlPacketType::CONNECT:
             {
-                uint16_t protocolNameLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                ptr += 2;
-                std::string protocolName(reinterpret_cast<char *>(ptr), protocolNameLen);
-                ptr += protocolNameLen;
+                session.protocolName = getStringFromBuffer(ptr);
                 auto variableHeader = *reinterpret_cast<Mqtt::ConnectFrameVariableHeader *>(ptr);
                 variableHeader.keepAlive = Poco::ByteOrder::toBigEndian(variableHeader.keepAlive);
+                session.keepAlive = variableHeader.keepAlive;
                 ptr += sizeof(Mqtt::ConnectFrameVariableHeader);
-                uint16_t clientIdLen = Poco::ByteOrder::toBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                ptr += 2;
-                std::string clientId(reinterpret_cast<char *>(ptr), clientIdLen);
-                ptr += clientIdLen;
+                session.clientId = getStringFromBuffer(ptr);
                 if (variableHeader.connectFlags.willFlag)
                 {
-                    uint16_t willTopicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                    ptr += 2;
-                    std::string willTopic(reinterpret_cast<char *>(ptr), willTopicLen);
-                    ptr += willTopicLen;
-                    uint16_t willMessageLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                    ptr += 2;
-                    std::string willMessage(reinterpret_cast<char *>(ptr), willMessageLen);
-                    ptr += willMessageLen;
+                    session.willTopic   = getStringFromBuffer(ptr);
+                    session.willMessage = getStringFromBuffer(ptr);
                 }
                 if (variableHeader.connectFlags.userNameFlag)
                 {
-                    uint16_t userNameLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                    ptr += 2;
-                    std::string userName(reinterpret_cast<char *>(ptr), userNameLen);
-                    ptr += userNameLen;
+                    session.userName = getStringFromBuffer(ptr);
                 }
                 if (variableHeader.connectFlags.passwordFlag)
                 {
                     uint16_t passwordLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                     ptr += 2;
-                    std::vector<uint8_t> password(passwordLen);
-                    memcpy(password.data(), ptr, passwordLen);
+                    session.password.resize(passwordLen);
+                    memcpy(session.password.data(), ptr, passwordLen);
                     ptr += passwordLen;
                 }
-                {// Form CONNACK
-                    data.resize(sizeof(Mqtt::FrameFixedHeader) + sizeof(Mqtt::ConnackFrameVariableHeader));
-                    fixedHeader->controlPackerType = Mqtt::ControlPacketType::CONNACK;
-                    fixedHeader->flags = 0;
-                    fixedHeader->length = 2;
-                    ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
-                    Mqtt::ConnackFrameVariableHeader *connackFrameVariableHeader = reinterpret_cast<Mqtt::ConnackFrameVariableHeader *>(ptr);
-                    connackFrameVariableHeader->connectReturnCode = Mqtt::ConnectReturnCode::ConnectionAccepted;
-                    connackFrameVariableHeader->sessionPresent = false;
-                    socket().sendBytes(data.data(), data.size());
-                }
+                formCONNACK(data, Mqtt::ConnectReturnCode::ConnectionAccepted, false);
+                socket().sendBytes(data.data(), data.size());
             }
             break;
             case (uint8_t) Mqtt::ControlPacketType::SUBSCRIBE:
             {
                 uint16_t packetIdentifier = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
                 ptr += 2;
-                std::vector <SubTopic> topics;
                 while (ptr - data.data() - 2 < fixedHeader->length)
                 {
-                    uint16_t topicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                    ptr += 2;
-                    std::string topic(reinterpret_cast<char *>(ptr), topicLen);
-                    ptr += topicLen;
+                    std::string topic = getStringFromBuffer(ptr);
                     uint8_t qos = *ptr;
                     ptr++;
-                    topics.push_back({topic, qos});
+                    session.subscriptionTopics.push_back({topic, qos});
                 }
-                { // Form SUBACK
-                    data.resize(sizeof(Mqtt::FrameFixedHeader) + 2 + topics.size());
-                    fixedHeader->controlPackerType = Mqtt::ControlPacketType::SUBACK;
-                    fixedHeader->flags = 0;
-                    fixedHeader->length = 2 + topics.size();
-                    ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
-                    uint16_t * subackPackId = reinterpret_cast<uint16_t*>(ptr);
-                    *subackPackId = Poco::ByteOrder::toBigEndian(packetIdentifier);
-                    ptr += 2;
-                    for (int i = 0; i < topics.size(); ++i)
-                    {
-                        *ptr = static_cast<uint8_t>(Mqtt::SubackReturnCode::SuccessMaximumQos2);
-                        ptr++;
-                    }
-                    socket().sendBytes(data.data(), data.size());
-                }
+                formSUBACK(data, packetIdentifier);
+                socket().sendBytes(data.data(), data.size());
             }
             break;
             case (uint8_t) Mqtt::ControlPacketType::UNSUBSCRIBE:
@@ -229,10 +205,7 @@ void MqttServerConnection::run()
                 publishFlags.retain = fixedHeader->flags & 1;
                 publishFlags.qos    = (fixedHeader->flags & 6) >> 1;
                 publishFlags.dup    = !!fixedHeader->flags & 8;
-                uint16_t topicLen = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
-                ptr += 2;
-                std::string topic(reinterpret_cast<char *>(ptr), topicLen);
-                ptr += topicLen;
+                std::string topic = getStringFromBuffer(ptr);
                 if (publishFlags.qos > 0)
                 {
                     packetIdentifier = Poco::ByteOrder::fromBigEndian(*reinterpret_cast<uint16_t *>(ptr));
@@ -241,10 +214,18 @@ void MqttServerConnection::run()
                 size_t payloadLen = fixedHeader->length - topic.size() - (publishFlags.qos > 0 ? 2 : 0);
                 std::vector <uint8_t> payload(payloadLen);
                 memcpy(payload.data(), ptr, payloadLen);
-                if (publishFlags.qos == 1)
-                { // Form PUBACK
+                MainSingleton::instance().PushMessageToQueue({topic, publishFlags.qos, payload});
+                if (publishFlags.qos > 0)
+                { // Form PUBACK or PUBREC
                     data.resize(sizeof(Mqtt::FrameFixedHeader) + 2);
-                    fixedHeader->controlPackerType = Mqtt::ControlPacketType::PUBACK;
+                    if (publishFlags.qos == 1)
+                    {
+                        fixedHeader->controlPackerType = Mqtt::ControlPacketType::PUBACK;
+                    }
+                    else if (publishFlags.qos == 2)
+                    {
+                        fixedHeader->controlPackerType = Mqtt::ControlPacketType::PUBREC;
+                    }
                     fixedHeader->flags = 0;
                     fixedHeader->length = 2;
                     ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
@@ -254,8 +235,51 @@ void MqttServerConnection::run()
                 }
             }
         }
+    }
+}
 
-        Poco::Util::Application &app = Poco::Util::Application::instance();
-        app.logger().debug("run");
+void formCONNACK(std::vector <uint8_t> & data, Mqtt::ConnectReturnCode returnCode, bool sessionPresent)
+{
+    data.resize(sizeof(Mqtt::FrameFixedHeader) + sizeof(Mqtt::ConnackFrameVariableHeader));
+    Mqtt::FrameFixedHeader * fixedHeader = reinterpret_cast<Mqtt::FrameFixedHeader*>(data.data());
+    fixedHeader->controlPackerType = Mqtt::ControlPacketType::CONNACK;
+    fixedHeader->flags = 0;
+    fixedHeader->length = 2;
+    uint8_t * ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
+    Mqtt::ConnackFrameVariableHeader *connackFrameVariableHeader = reinterpret_cast<Mqtt::ConnackFrameVariableHeader *>(ptr);
+    connackFrameVariableHeader->connectReturnCode = returnCode;
+    connackFrameVariableHeader->sessionPresent = sessionPresent;
+}
+
+void MqttServerConnection::formSUBACK(std::vector<uint8_t> &data, uint16_t packetIdentifier) const
+{
+    data.resize(sizeof(Mqtt::FrameFixedHeader) + 2 + session.subscriptionTopics.size());
+    Mqtt::FrameFixedHeader * fixedHeader = reinterpret_cast<Mqtt::FrameFixedHeader*>(data.data());
+    fixedHeader->controlPackerType = Mqtt::ControlPacketType::SUBACK;
+    fixedHeader->flags = 0;
+    fixedHeader->length = static_cast<uint8_t>(2 + session.subscriptionTopics.size());
+    uint8_t * ptr = data.data() + sizeof(Mqtt::FrameFixedHeader);
+    uint16_t * subackPackId = reinterpret_cast<uint16_t*>(ptr);
+    *subackPackId = Poco::ByteOrder::toBigEndian(packetIdentifier);
+    ptr += 2;
+    for (auto & subscriptionTopic : session.subscriptionTopics)
+    {
+        if (subscriptionTopic.failure)
+        {
+            *ptr = static_cast<uint8_t>(Mqtt::SubackReturnCode::Failure);
+        }
+        else if (subscriptionTopic.qos == 0)
+        {
+            *ptr = static_cast<uint8_t>(Mqtt::SubackReturnCode::SuccessMaximumQos0);
+        }
+        else if (subscriptionTopic.qos == 1)
+        {
+            *ptr = static_cast<uint8_t>(Mqtt::SubackReturnCode::SuccessMaximumQos1);
+        }
+        else if (subscriptionTopic.qos == 2)
+        {
+            *ptr = static_cast<uint8_t>(Mqtt::SubackReturnCode::SuccessMaximumQos2);
+        }
+        ptr++;
     }
 }
